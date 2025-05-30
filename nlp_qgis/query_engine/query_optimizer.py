@@ -29,6 +29,11 @@ class QueryOptimizer:
         self.limit_features = False
         self.max_features = 10000
         
+        # Performance thresholds
+        self.large_dataset_threshold = 50000  # features
+        self.memory_limit_mb = 512
+        self.processing_timeout_seconds = 300
+        
     def set_project(self, project):
         """
         Set the QGIS project instance.
@@ -59,6 +64,7 @@ class QueryOptimizer:
                 break
                 
         if not layer:
+            self.logger.warning(f"Layer '{layer_name}' not found")
             return {}
             
         # Collect statistics
@@ -67,36 +73,48 @@ class QueryOptimizer:
             'has_spatial_index': False,
             'geometry_type': None,
             'field_count': 0,
-            'estimated_size_mb': 0
+            'estimated_size_mb': 0,
+            'extent_area': 0,
+            'is_large_dataset': False
         }
         
-        # Get feature count
-        feature_count = layer.featureCount()
-        stats['feature_count'] = feature_count
-        
-        # Check if layer has spatial index
-        if hasattr(layer, 'hasSpatialIndex'):
-            stats['has_spatial_index'] = layer.hasSpatialIndex()
+        try:
+            # Get feature count
+            feature_count = layer.featureCount()
+            stats['feature_count'] = feature_count
+            stats['is_large_dataset'] = feature_count > self.large_dataset_threshold
             
-        # Get geometry type
-        if hasattr(layer, 'geometryType'):
-            stats['geometry_type'] = layer.geometryType()
+            # Check if layer has spatial index
+            if hasattr(layer, 'hasSpatialIndex'):
+                stats['has_spatial_index'] = layer.hasSpatialIndex()
+                
+            # Get geometry type
+            if hasattr(layer, 'geometryType'):
+                stats['geometry_type'] = layer.geometryType()
+                
+            # Count fields
+            if hasattr(layer, 'fields'):
+                stats['field_count'] = len(layer.fields())
+                
+            # Calculate extent area
+            if hasattr(layer, 'extent'):
+                extent = layer.extent()
+                stats['extent_area'] = extent.width() * extent.height()
+                
+            # Estimate size (very rough heuristic)
+            avg_feature_size_bytes = 100  # Base size
+            if stats['field_count'] > 0:
+                avg_feature_size_bytes += stats['field_count'] * 20
+                
+            if stats['geometry_type'] == 2:  # Polygon
+                avg_feature_size_bytes += 500
+            elif stats['geometry_type'] == 1:  # Line
+                avg_feature_size_bytes += 200
+                
+            stats['estimated_size_mb'] = (feature_count * avg_feature_size_bytes) / (1024 * 1024)
             
-        # Count fields
-        if hasattr(layer, 'fields'):
-            stats['field_count'] = len(layer.fields())
-            
-        # Estimate size (very rough heuristic)
-        avg_feature_size_bytes = 100  # Rough estimate
-        if stats['field_count'] > 0:
-            avg_feature_size_bytes += stats['field_count'] * 20
-            
-        if stats['geometry_type'] == 2:  # Polygon
-            avg_feature_size_bytes += 500
-        elif stats['geometry_type'] == 1:  # Line
-            avg_feature_size_bytes += 200
-            
-        stats['estimated_size_mb'] = (feature_count * avg_feature_size_bytes) / (1024 * 1024)
+        except Exception as e:
+            self.logger.error(f"Error calculating layer statistics: {str(e)}")
         
         return stats
         
@@ -143,13 +161,19 @@ class QueryOptimizer:
         # Check if we need to limit features due to large datasets
         large_dataset = (
             input_stats.get('feature_count', 0) > self.max_features or
-            input_stats.get('estimated_size_mb', 0) > 100  # 100MB threshold
+            input_stats.get('estimated_size_mb', 0) > self.memory_limit_mb
         )
         
         if large_dataset and self.limit_features:
             optimized['optimizations']['limit_features'] = True
             optimized['optimizations']['max_features'] = self.max_features
+            optimized['optimizations']['reason'] = 'Large dataset detected'
             
+        # Add processing hints
+        optimized['optimizations']['estimated_processing_time'] = self._estimate_processing_time(
+            operation, input_stats, secondary_stats
+        )
+        
         return optimized
         
     def _optimize_buffer_query(self, query: Dict[str, Any], layer_stats: Dict[str, Any]) -> Dict[str, Any]:
@@ -182,11 +206,15 @@ class QueryOptimizer:
                 
             optimized['optimizations']['reduced_segments'] = True
             optimized['optimizations']['disable_dissolve'] = True
+            optimized['optimizations']['reason'] = 'Large dataset optimization'
             
         # For very small buffers, we can reduce segments further
         distance = params.get('distance', 0)
         if distance < 10:  # Less than 10 meters
             params['segments'] = min(params.get('segments', 8), 4)
+            if 'optimizations' not in optimized:
+                optimized['optimizations'] = {}
+            optimized['optimizations']['reduced_segments_small_buffer'] = True
             
         # Update parameters
         optimized['parameters'] = params
@@ -213,534 +241,271 @@ class QueryOptimizer:
         input_count = input_stats.get('feature_count', 0)
         overlay_count = overlay_stats.get('feature_count', 0)
         
+        # Initialize optimizations dict
+        if 'optimizations' not in optimized:
+            optimized['optimizations'] = {}
+        
         # For union operations with large datasets
         if operation == 'union' and (input_count > 5000 or overlay_count > 5000):
-            # Add optimization notes
-            if 'optimizations' not in optimized:
-                optimized['optimizations'] = {}
-                
             # Suggest alternative algorithm for large unions
-            optimized['optimizations']['algorithm'] = 'native:union'  # Use native union instead of default
+            optimized['optimizations']['algorithm'] = 'native:union'
             optimized['optimizations']['memory_efficient'] = True
+            optimized['optimizations']['reason'] = 'Large dataset union optimization'
             
         # For intersection with very different sized inputs
         if operation == 'intersection' and min(input_count, overlay_count) > 0:
             ratio = max(input_count, overlay_count) / min(input_count, overlay_count)
             
             if ratio > 10:  # Big difference in sizes
-                # Add optimization notes
-                if 'optimizations' not in optimize# query_engine/query_parser.py
-import re
-import json
-from typing import Dict, List, Any, Optional, Tuple, Union
-import logging
-
-class NLPQueryParser:
-    """
-    NLP-driven query parser that converts natural language input into GIS scripts.
-    
-    This parser handles the conversion of ambiguous natural language queries
-    into explicit, structured GIS operations with complete parameters.
-    """
-    
-    def __init__(self, nlp_engine=None):
+                # Suggest processing smaller layer first
+                if input_count > overlay_count:
+                    optimized['optimizations']['swap_inputs'] = True
+                    optimized['optimizations']['reason'] = 'Size difference optimization'
+                    
+        # For clip operations, check if overlay is much larger than input
+        if operation == 'clip':
+            if overlay_count > input_count * 5:
+                optimized['optimizations']['spatial_index_critical'] = True
+                optimized['optimizations']['reason'] = 'Large overlay layer optimization'
+                
+        # Memory usage estimation
+        total_features = input_count + overlay_count
+        if total_features > 100000:
+            optimized['optimizations']['high_memory_operation'] = True
+            optimized['optimizations']['suggested_batch_size'] = 10000
+            
+        return optimized
+        
+    def _optimize_select_query(self, query: Dict[str, Any], layer_stats: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Initialize the query parser.
+        Optimize a select query.
         
         Args:
-            nlp_engine: Optional NLP engine instance
-        """
-        self.nlp_engine = nlp_engine
-        
-        # Set up logger
-        self.logger = logging.getLogger('NLPGISPlugin.QueryParser')
-        
-        # Command patterns for simple pattern matching
-        self.command_patterns = {
-            'buffer': [
-                r'(?:create|make)?\s*(?:a|the)?\s*buffer\s+(?:of|around|for)?\s*([\w\s]+)\s+(?:by|of|with)?\s*([\d\.]+)\s*(meter|meters|m|kilometer|kilometers|km|feet|foot|ft|mile|miles|mi)',
-                r'buffer\s+(?:the|a)?\s*([\w\s]+)\s+(?:by|with)?\s*([\d\.]+)\s*(meter|meters|m|kilometer|kilometers|km|feet|foot|ft|mile|miles|mi)'
-            ],
-            'clip': [
-                r'clip\s+(?:the|a)?\s*([\w\s]+)\s+(?:with|using|by)\s+(?:the|a)?\s*([\w\s]+)',
-                r'extract\s+(?:the|a)?\s*([\w\s]+)\s+from\s+(?:the|a)?\s*([\w\s]+)'
-            ],
-            'intersection': [
-                r'(?:find|get|compute|calculate)\s+(?:the)?\s*intersection\s+(?:of|between)?\s+(?:the|a)?\s*([\w\s]+)\s+(?:and|with)\s+(?:the|a)?\s*([\w\s]+)',
-                r'intersect\s+(?:the|a)?\s*([\w\s]+)\s+(?:with|and)\s+(?:the|a)?\s*([\w\s]+)'
-            ],
-            'select': [
-                r'select\s+(?:from|in)?\s*(?:the|a)?\s*([\w\s]+)\s+where\s+(.*)',
-                r'find\s+(?:all)?\s*([\w\s]+)\s+where\s+(.*)',
-                r'show\s+(?:me)?\s+(?:all)?\s*([\w\s]+)\s+(?:that|which)\s+(.*)'
-            ]
-        }
-        
-    def set_nlp_engine(self, nlp_engine):
-        """
-        Set the NLP engine instance.
-        
-        Args:
-            nlp_engine: NLP engine instance
-        """
-        self.nlp_engine = nlp_engine
-        
-    def parse_query(self, query_text: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        Parse a natural language query into a structured GIS operation.
-        
-        Args:
-            query_text: Natural language query
-            context: Optional context information (active layers, etc.)
+            query: Select query
+            layer_stats: Statistics for the layer
             
         Returns:
-            Dictionary with parsed operation details
+            Optimized query
         """
-        # Use NLP engine if available
-        if self.nlp_engine:
-            # Get active layers from context
-            active_layers = None
-            current_crs = None
-            if context:
-                active_layers = context.get('active_layers', [])
-                active_layers = [layer.get('name') for layer in active_layers] if isinstance(active_layers[0], dict) else active_layers
-                current_crs = context.get('crs')
+        optimized = query.copy()
+        params = optimized.get('parameters', {}).copy()
+        
+        # Initialize optimizations dict
+        if 'optimizations' not in optimized:
+            optimized['optimizations'] = {}
+            
+        # For large datasets, suggest using spatial index
+        if layer_stats.get('feature_count', 0) > 10000:
+            optimized['optimizations']['use_spatial_index'] = True
+            
+            # If expression involves geometry, suggest spatial filtering first
+            expression = params.get('expression', '')
+            if any(keyword in expression.lower() for keyword in ['intersects', 'contains', 'within', 'distance']):
+                optimized['optimizations']['spatial_first'] = True
+                optimized['optimizations']['reason'] = 'Spatial query on large dataset'
                 
-            # Process with NLP engine
-            nlp_result = self.nlp_engine.process_command(
-                query_text,
-                active_layers=active_layers,
-                current_crs=current_crs
-            )
+        # Analyze expression complexity
+        expression = params.get('expression', '')
+        if expression:
+            # Count operators and functions
+            operator_count = sum(expression.count(op) for op in ['AND', 'OR', '>', '<', '=', 'LIKE'])
+            if operator_count > 5:
+                optimized['optimizations']['complex_expression'] = True
+                optimized['optimizations']['reason'] = 'Complex expression detected'
+                
+        return optimized
+        
+    def _estimate_processing_time(self, operation: str, input_stats: Dict[str, Any], 
+                                secondary_stats: Dict[str, Any] = None) -> str:
+        """
+        Estimate processing time for an operation.
+        
+        Args:
+            operation: Operation type
+            input_stats: Input layer statistics
+            secondary_stats: Secondary layer statistics (if applicable)
             
-            # Enhance the result with pattern matching for specific operation types
-            enhanced_result = self._enhance_with_pattern_matching(nlp_result, query_text)
-            
-            # Fill in missing parameters based on context
-            complete_result = self._fill_missing_parameters(enhanced_result, context)
-            
-            return complete_result
-            
+        Returns:
+            Estimated processing time as string
+        """
+        input_count = input_stats.get('feature_count', 0)
+        secondary_count = secondary_stats.get('feature_count', 0) if secondary_stats else 0
+        
+        # Simple heuristic based on feature counts and operation type
+        if operation == 'buffer':
+            if input_count < 1000:
+                return "< 5 seconds"
+            elif input_count < 10000:
+                return "5-30 seconds"
+            else:
+                return "30+ seconds"
+                
+        elif operation in ['clip', 'intersection']:
+            total_complexity = input_count * (secondary_count / 1000 + 1)
+            if total_complexity < 10000:
+                return "< 10 seconds"
+            elif total_complexity < 100000:
+                return "10-60 seconds"
+            else:
+                return "1+ minutes"
+                
+        elif operation == 'select':
+            if input_count < 5000:
+                return "< 2 seconds"
+            elif input_count < 50000:
+                return "2-10 seconds"
+            else:
+                return "10+ seconds"
+                
         else:
-            # Fall back to pattern matching only
-            return self._parse_with_patterns(query_text, context)
+            return "Unknown"
             
-    def _parse_with_patterns(self, query_text: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def optimize_query_sequence(self, queries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Parse a query using regex pattern matching as fallback.
+        Optimize a sequence of queries for better overall performance.
         
         Args:
-            query_text: Natural language query
-            context: Optional context information
+            queries: List of query dictionaries
             
         Returns:
-            Dictionary with parsed operation details
+            Optimized sequence of queries
         """
-        query_text = query_text.lower().strip()
+        if not queries:
+            return queries
+            
+        optimized_sequence = []
         
-        # Check each operation type
-        for operation, patterns in self.command_patterns.items():
-            for pattern in patterns:
-                match = re.search(pattern, query_text, re.IGNORECASE)
-                if match:
-                    # Different operations have different parameter structures
-                    if operation == 'buffer':
-                        input_layer = match.group(1).strip()
-                        distance = float(match.group(2))
-                        unit = match.group(3).lower()
-                        
-                        # Convert to meters for consistency
-                        if unit in ['kilometer', 'kilometers', 'km']:
-                            distance *= 1000
-                        elif unit in ['feet', 'foot', 'ft']:
-                            distance *= 0.3048
-                        elif unit in ['mile', 'miles', 'mi']:
-                            distance *= 1609.34
-                            
-                        return {
-                            'operation': 'buffer',
-                            'input_layer': input_layer,
-                            'parameters': {
-                                'distance': distance,
-                                'unit': 'meters'  # Standardized unit
-                            },
-                            'confidence': 0.8,
-                            'original_text': query_text
-                        }
-                        
-                    elif operation in ['clip', 'intersection']:
-                        input_layer = match.group(1).strip()
-                        overlay_layer = match.group(2).strip()
-                        
-                        return {
-                            'operation': operation,
-                            'input_layer': input_layer,
-                            'secondary_layer': overlay_layer,
-                            'parameters': {},
-                            'confidence': 0.8,
-                            'original_text': query_text
-                        }
-                        
-                    elif operation == 'select':
-                        input_layer = match.group(1).strip()
-                        where_clause = match.group(2).strip()
-                        
-                        return {
-                            'operation': 'select',
-                            'input_layer': input_layer,
-                            'parameters': {
-                                'expression': where_clause
-                            },
-                            'confidence': 0.7,  # Lower confidence as expressions can be complex
-                            'original_text': query_text
-                        }
+        # Group queries by operation type for potential batching
+        operation_groups = {}
+        for i, query in enumerate(queries):
+            operation = query.get('operation', 'unknown')
+            if operation not in operation_groups:
+                operation_groups[operation] = []
+            operation_groups[operation].append((i, query))
+            
+        # Reorder for optimal execution
+        # 1. Selection operations first (reduce dataset size)
+        # 2. Simple geometric operations
+        # 3. Complex overlay operations last
         
-        # No pattern matched, return a generic result
-        return {
-            'operation': 'unknown',
-            'input_layer': None,
-            'parameters': {},
-            'confidence': 0.1,
-            'original_text': query_text
+        operation_priority = {
+            'select': 1,
+            'buffer': 2,
+            'clip': 3,
+            'intersection': 4,
+            'union': 5
         }
         
-    def _enhance_with_pattern_matching(self, nlp_result: Dict[str, Any], query_text: str) -> Dict[str, Any]:
+        # Sort operations by priority
+        sorted_operations = sorted(operation_groups.keys(), 
+                                 key=lambda x: operation_priority.get(x, 99))
+        
+        # Rebuild sequence
+        for operation in sorted_operations:
+            for original_index, query in operation_groups[operation]:
+                optimized_query = self.optimize_query(query)
+                optimized_query['original_sequence_index'] = original_index
+                optimized_sequence.append(optimized_query)
+                
+        return optimized_sequence
+        
+    def add_warnings_for_expensive_queries(self, query: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Enhance NLP result with pattern matching for specific parameters.
+        Add warnings for potentially expensive operations.
         
         Args:
-            nlp_result: Result from NLP engine
-            query_text: Original query text
+            query: Query dictionary
             
         Returns:
-            Enhanced result dictionary
+            Query with warnings added
         """
-        # If operation is already high confidence, return as is
-        if nlp_result.get('confidence', 0) > 0.8:
-            return nlp_result
-            
-        # Operation specific enhancements
-        operation = nlp_result.get('operation')
+        warned_query = query.copy()
         
-        if operation == 'buffer':
-            # Look for distance with unit pattern
-            distance_pattern = r'(\d+\.?\d*)\s*(meter|meters|m|kilometer|kilometers|km|feet|foot|ft|mile|miles|mi)'
-            match = re.search(distance_pattern, query_text, re.IGNORECASE)
+        # Initialize warnings list
+        if 'warnings' not in warned_query:
+            warned_query['warnings'] = []
             
-            if match and 'distance' not in nlp_result.get('parameters', {}):
-                distance = float(match.group(1))
-                unit = match.group(2).lower()
+        operation = query.get('operation')
+        input_layer = query.get('input_layer')
+        
+        # Get layer statistics
+        if input_layer:
+            stats = self.get_layer_statistics(input_layer)
+            
+            # Warning for large datasets
+            if stats.get('feature_count', 0) > self.large_dataset_threshold:
+                warned_query['warnings'].append({
+                    'type': 'performance',
+                    'message': f"Large dataset detected ({stats['feature_count']} features). "
+                             f"Operation may take several minutes.",
+                    'severity': 'warning'
+                })
                 
-                # Convert to meters for consistency
-                if unit in ['kilometer', 'kilometers', 'km']:
-                    distance *= 1000
-                elif unit in ['feet', 'foot', 'ft']:
-                    distance *= 0.3048
-                elif unit in ['mile', 'miles', 'mi']:
-                    distance *= 1609.34
-                    
-                # Update parameters
-                if 'parameters' not in nlp_result:
-                    nlp_result['parameters'] = {}
-                    
-                nlp_result['parameters']['distance'] = distance
-                nlp_result['parameters']['unit'] = 'meters'
+            # Warning for very large buffers
+            if operation == 'buffer':
+                distance = query.get('parameters', {}).get('distance', 0)
+                extent_area = stats.get('extent_area', 0)
                 
-                # Increase confidence slightly
-                nlp_result['confidence'] = min(nlp_result.get('confidence', 0) + 0.1, 1.0)
-                
-        elif operation in ['clip', 'intersection', 'union']:
-            # Look for secondary layer if not already identified
-            if not nlp_result.get('secondary_layer'):
-                # Pattern like "X with Y" or "X and Y"
-                secondary_pattern = r'(?:with|and|using|by|over|against)\s+(?:the|a)?\s*([\w\s]+)'
-                match = re.search(secondary_pattern, query_text, re.IGNORECASE)
-                
-                if match:
-                    secondary_layer = match.group(1).strip()
-                    nlp_result['secondary_layer'] = secondary_layer
-                    
-                    # Increase confidence slightly
-                    nlp_result['confidence'] = min(nlp_result.get('confidence', 0) + 0.1, 1.0)
-                    
-        elif operation == 'select':
-            # Look for where clause if not already identified
-            if 'expression' not in nlp_result.get('parameters', {}):
-                # Pattern like "where X = Y" or "that have X > Y"
-                where_pattern = r'(?:where|that|which|with)\s+([\w\s]+\s*(?:>|<|=|is|equals|contains|in)\s*[\w\s\.]+)'
-                match = re.search(where_pattern, query_text, re.IGNORECASE)
-                
-                if match:
-                    expression = match.group(1).strip()
-                    
-                    if 'parameters' not in nlp_result:
-                        nlp_result['parameters'] = {}
+                if distance > 0 and extent_area > 0:
+                    buffer_area_ratio = (3.14159 * distance * distance) / extent_area
+                    if buffer_area_ratio > 0.5:  # Buffer area > 50% of layer extent
+                        warned_query['warnings'].append({
+                            'type': 'geometry',
+                            'message': "Buffer distance is very large relative to layer extent. "
+                                     "This may create overlapping geometries.",
+                            'severity': 'warning'
+                        })
                         
-                    nlp_result['parameters']['expression'] = expression
-                    
-                    # Increase confidence slightly
-                    nlp_result['confidence'] = min(nlp_result.get('confidence', 0) + 0.1, 1.0)
-                    
-        return nlp_result
+            # Warning for memory-intensive operations
+            estimated_memory = stats.get('estimated_size_mb', 0)
+            if operation in ['union', 'intersection'] and estimated_memory > self.memory_limit_mb:
+                warned_query['warnings'].append({
+                    'type': 'memory',
+                    'message': f"Operation may require significant memory ({estimated_memory:.1f} MB). "
+                             f"Consider processing in smaller batches.",
+                    'severity': 'warning'
+                })
+                
+        return warned_query
         
-    def _fill_missing_parameters(self, result: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def get_optimization_suggestions(self, query: Dict[str, Any]) -> List[str]:
         """
-        Fill in missing parameters based on context.
+        Get optimization suggestions for a query.
         
         Args:
-            result: Parsed operation result
-            context: Optional context information
+            query: Query dictionary
             
         Returns:
-            Result with filled parameters
-        """
-        if not context:
-            return result
-            
-        # Make a copy to avoid modifying the original
-        filled_result = result.copy()
-        
-        # Get operation type
-        operation = filled_result.get('operation')
-        
-        # Fill in input layer if missing
-        if not filled_result.get('input_layer') and context.get('active_layers'):
-            # Use the currently selected layer if available
-            selected_layer = context.get('selected_layer')
-            if selected_layer:
-                filled_result['input_layer'] = selected_layer
-                filled_result['parameters']['auto_completed_input'] = True
-                
-            # Otherwise use the first visible layer
-            elif context.get('active_layers'):
-                visible_layers = []
-                if isinstance(context['active_layers'][0], dict):
-                    visible_layers = [layer.get('name') for layer in context['active_layers'] 
-                                    if layer.get('visible', True)]
-                else:
-                    visible_layers = context['active_layers']
-                    
-                if visible_layers:
-                    filled_result['input_layer'] = visible_layers[0]
-                    filled_result['parameters']['auto_completed_input'] = True
-                    
-        # Operation-specific parameter filling
-        if operation == 'buffer' and 'distance' not in filled_result.get('parameters', {}):
-            # Default buffer distance based on current map scale
-            if context.get('scale'):
-                scale = context.get('scale')
-                # Heuristic: use 1% of the current view extent as default buffer
-                if context.get('extent'):
-                    extent = context.get('extent')
-                    width = extent.get('xmax', 0) - extent.get('xmin', 0)
-                    height = extent.get('ymax', 0) - extent.get('ymin', 0)
-                    avg_dimension = (width + height) / 2
-                    default_distance = avg_dimension * 0.01  # 1% of view size
-                    
-                    if 'parameters' not in filled_result:
-                        filled_result['parameters'] = {}
-                        
-                    filled_result['parameters']['distance'] = default_distance
-                    filled_result['parameters']['unit'] = 'meters'
-                    filled_result['parameters']['auto_completed_distance'] = True
-                    
-        elif operation in ['clip', 'intersection', 'union'] and not filled_result.get('secondary_layer'):
-            # Try to suggest a secondary layer
-            if context.get('active_layers'):
-                # Get all layers except the input layer
-                input_layer = filled_result.get('input_layer')
-                other_layers = []
-                
-                if isinstance(context['active_layers'][0], dict):
-                    other_layers = [layer.get('name') for layer in context['active_layers'] 
-                                    if layer.get('name') != input_layer]
-                else:
-                    other_layers = [layer for layer in context['active_layers'] if layer != input_layer]
-                    
-                if other_layers:
-                    filled_result['secondary_layer'] = other_layers[0]
-                    filled_result['parameters']['auto_completed_secondary'] = True
-                    
-        return filled_result
-        
-    def validate_query(self, parsed_query: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        Validate a parsed query for completeness and correctness.
-        
-        Args:
-            parsed_query: Parsed query dictionary
-            
-        Returns:
-            List of validation issues (empty if valid)
-        """
-        issues = []
-        
-        # Check operation type
-        operation = parsed_query.get('operation')
-        if not operation or operation == 'unknown':
-            issues.append({
-                'severity': 'error',
-                'message': 'Unknown or missing operation type.'
-            })
-            return issues  # Can't validate further without operation
-            
-        # Check input layer
-        if not parsed_query.get('input_layer'):
-            issues.append({
-                'severity': 'error',
-                'message': f'No input layer specified for {operation} operation.'
-            })
-            
-        # Operation-specific validation
-        if operation == 'buffer':
-            # Check distance parameter
-            if 'distance' not in parsed_query.get('parameters', {}):
-                issues.append({
-                    'severity': 'error',
-                    'message': 'No buffer distance specified.'
-                })
-            elif parsed_query['parameters']['distance'] <= 0:
-                issues.append({
-                    'severity': 'warning',
-                    'message': 'Buffer distance must be greater than zero.'
-                })
-            elif parsed_query['parameters']['distance'] > 10000:
-                issues.append({
-                    'severity': 'warning',
-                    'message': 'Very large buffer distance may cause performance issues.'
-                })
-                
-        elif operation in ['clip', 'intersection', 'union']:
-            # Check overlay layer
-            if not parsed_query.get('secondary_layer'):
-                issues.append({
-                    'severity': 'error',
-                    'message': f'No overlay layer specified for {operation} operation.'
-                })
-                
-        elif operation == 'select':
-            # Check selection criteria
-            if 'expression' not in parsed_query.get('parameters', {}) and not parsed_query.get('spatial_relationship'):
-                issues.append({
-                    'severity': 'error',
-                    'message': 'No selection criteria specified.'
-                })
-                
-        # Check confidence
-        confidence = parsed_query.get('confidence', 0)
-        if confidence < 0.6:
-            issues.append({
-                'severity': 'warning',
-                'message': f'Low confidence in query interpretation ({confidence:.2f}). Please clarify the command.'
-            })
-            
-        return issues
-    
-    def suggest_query_completion(self, partial_query: Dict[str, Any]) -> List[str]:
-        """
-        Suggest ways to complete a partial query.
-        
-        Args:
-            partial_query: Partially parsed query
-            
-        Returns:
-            List of completion suggestions
+            List of optimization suggestions
         """
         suggestions = []
         
-        # Get operation type
-        operation = partial_query.get('operation')
+        operation = query.get('operation')
+        input_layer = query.get('input_layer')
         
-        if not operation or operation == 'unknown':
-            # Suggest common operations
-            suggestions.append("Try specifying an operation like 'buffer', 'clip', 'select', or 'intersection'")
-            return suggestions
+        if input_layer:
+            stats = self.get_layer_statistics(input_layer)
             
-        # Operation-specific suggestions
-        if operation == 'buffer':
-            if not partial_query.get('input_layer'):
-                suggestions.append("Specify which layer to buffer, e.g., 'buffer the roads layer'")
+            # Suggest spatial indexing
+            if not stats.get('has_spatial_index', False) and stats.get('feature_count', 0) > 1000:
+                suggestions.append("Consider creating a spatial index on the input layer for better performance")
                 
-            if 'distance' not in partial_query.get('parameters', {}):
-                suggestions.append("Specify a buffer distance, e.g., 'buffer by 500 meters'")
+            # Suggest data preprocessing
+            if stats.get('feature_count', 0) > self.large_dataset_threshold:
+                suggestions.append("For large datasets, consider filtering data first to reduce processing time")
                 
-        elif operation in ['clip', 'intersection', 'union']:
-            if not partial_query.get('input_layer'):
-                suggestions.append(f"Specify the input layer for {operation}, e.g., '{operation} the roads layer'")
-                
-            if not partial_query.get('secondary_layer'):
-                suggestions.append(f"Specify the overlay layer, e.g., '{operation} with city boundaries'")
-                
-        elif operation == 'select':
-            if not partial_query.get('input_layer'):
-                suggestions.append("Specify which layer to select from, e.g., 'select from buildings'")
-                
-            if 'expression' not in partial_query.get('parameters', {}):
-                suggestions.append("Specify selection criteria, e.g., 'where area > 1000' or 'within 500m of rivers'")
-                
+            # Operation-specific suggestions
+            if operation == 'buffer':
+                distance = query.get('parameters', {}).get('distance', 0)
+                if distance > 1000:  # > 1km
+                    suggestions.append("Large buffer distances may benefit from lower segment counts")
+                    
+            elif operation in ['clip', 'intersection', 'union']:
+                secondary_layer = query.get('secondary_layer')
+                if secondary_layer:
+                    secondary_stats = self.get_layer_statistics(secondary_layer)
+                    if (stats.get('feature_count', 0) > 10000 and 
+                        secondary_stats.get('feature_count', 0) > 10000):
+                        suggestions.append("Both layers are large - consider spatial filtering before overlay operations")
+                        
         return suggestions
-        
-    def format_as_qgis_command(self, parsed_query: Dict[str, Any]) -> str:
-        """
-        Format a parsed query as a QGIS processing command.
-        
-        Args:
-            parsed_query: Parsed query dictionary
-            
-        Returns:
-            QGIS command string
-        """
-        operation = parsed_query.get('operation')
-        
-        if operation == 'buffer':
-            input_layer = parsed_query.get('input_layer', 'input_layer')
-            distance = parsed_query.get('parameters', {}).get('distance', 0)
-            
-            return (
-                f"processing.run('native:buffer', "
-                f"{{'INPUT': '{input_layer}', "
-                f"'DISTANCE': {distance}, "
-                f"'SEGMENTS': 5, "
-                f"'END_CAP_STYLE': 0, "
-                f"'JOIN_STYLE': 0, "
-                f"'MITER_LIMIT': 2, "
-                f"'DISSOLVE': False, "
-                f"'OUTPUT': 'TEMPORARY_OUTPUT'}})"
-            )
-            
-        elif operation == 'clip':
-            input_layer = parsed_query.get('input_layer', 'input_layer')
-            overlay_layer = parsed_query.get('secondary_layer', 'overlay_layer')
-            
-            return (
-                f"processing.run('native:clip', "
-                f"{{'INPUT': '{input_layer}', "
-                f"'OVERLAY': '{overlay_layer}', "
-                f"'OUTPUT': 'TEMPORARY_OUTPUT'}})"
-            )
-            
-        elif operation == 'intersection':
-            input_layer = parsed_query.get('input_layer', 'input_layer')
-            overlay_layer = parsed_query.get('secondary_layer', 'overlay_layer')
-            
-            return (
-                f"processing.run('native:intersection', "
-                f"{{'INPUT': '{input_layer}', "
-                f"'OVERLAY': '{overlay_layer}', "
-                f"'INPUT_FIELDS': [], "
-                f"'OVERLAY_FIELDS': [], "
-                f"'OUTPUT': 'TEMPORARY_OUTPUT'}})"
-            )
-            
-        elif operation == 'select':
-            input_layer = parsed_query.get('input_layer', 'input_layer')
-            expression = parsed_query.get('parameters', {}).get('expression', '')
-            
-            # This is simplified - real implementation would parse the expression
-            return (
-                f"layer = QgsProject.instance().mapLayersByName('{input_layer}')[0]\n"
-                f"layer.selectByExpression(\"{expression}\")"
-            )
-            
-        else:
-            return f"# Operation '{operation}' not implemented"

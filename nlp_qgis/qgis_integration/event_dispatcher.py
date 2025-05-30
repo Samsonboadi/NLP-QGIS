@@ -1,7 +1,18 @@
 # qgis_integration/event_dispatcher.py
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-from qgis.PyQt.QtCore import QObject, pyqtSignal, pyqtSlot
-from qgis.core import QgsProject, QgsMapLayer
+from qgis.PyQt.QtCore import QObject, pyqtSignal, pyqtSlot, QDateTime, Qt
+from qgis.core import QgsProject, QgsMapLayer, QgsWkbTypes, QgsProcessingException
+import logging
+import traceback
+
+# Import QGIS processing
+try:
+    from qgis.core import QgsProcessing
+    from qgis import processing
+    PROCESSING_AVAILABLE = True
+except ImportError:
+    PROCESSING_AVAILABLE = False
+    logging.warning("QGIS processing not available")
 
 class GISEventDispatcher(QObject):
     """
@@ -26,6 +37,7 @@ class GISEventDispatcher(QObject):
         """
         super().__init__()
         self.iface = iface
+        self.logger = logging.getLogger('NLPGISPlugin.EventDispatcher')
         
         # Store mapping of command types to handler functions
         self.command_handlers = {}
@@ -94,6 +106,7 @@ class GISEventDispatcher(QObject):
             handler_func: Function to call when this command is dispatched
         """
         self.command_handlers[command_type] = handler_func
+        self.logger.info(f"Registered handler for command type: {command_type}")
         
     def dispatch_command(self, command: Dict[str, Any]) -> Tuple[bool, str]:
         """
@@ -107,6 +120,9 @@ class GISEventDispatcher(QObject):
         """
         # Get the operation type
         operation = command.get('operation', '').lower()
+        
+        # Emit signal for command received
+        self.command_interpreted.emit(command)
         
         # Check if we have a handler for this operation
         if operation in self.command_handlers:
@@ -123,9 +139,17 @@ class GISEventDispatcher(QObject):
                     'timestamp': QDateTime.currentDateTime().toString(Qt.ISODate)
                 })
                 
+                # Emit success signal
+                command_id = f"{operation}_{QDateTime.currentDateTime().toString()}"
+                self.command_executed.emit(command_id, True, f"Successfully executed {operation} operation.")
+                
                 return True, f"Successfully executed {operation} operation."
                 
             except Exception as e:
+                error_msg = f"Error executing {operation}: {str(e)}"
+                self.logger.error(error_msg)
+                self.logger.error(traceback.format_exc())
+                
                 # Record failure
                 self.operation_history.append({
                     'type': 'nlp_command',
@@ -136,9 +160,15 @@ class GISEventDispatcher(QObject):
                     'timestamp': QDateTime.currentDateTime().toString(Qt.ISODate)
                 })
                 
-                return False, f"Error executing {operation}: {str(e)}"
+                # Emit failure signal
+                command_id = f"{operation}_{QDateTime.currentDateTime().toString()}"
+                self.command_executed.emit(command_id, False, error_msg)
+                
+                return False, error_msg
         else:
-            return False, f"No handler registered for operation: {operation}"
+            error_msg = f"No handler registered for operation: {operation}"
+            self.logger.warning(error_msg)
+            return False, error_msg
             
     def get_current_context(self) -> Dict[str, Any]:
         """
@@ -153,29 +183,40 @@ class GISEventDispatcher(QObject):
         # Get current layers
         layers = []
         for layer_id, layer in project.mapLayers().items():
-            layers.append({
-                'id': layer_id,
-                'name': layer.name(),
-                'type': self._get_layer_type(layer),
-                'visible': self.iface.layerTreeView().isLayerVisible(layer)
-            })
+            try:
+                layers.append({
+                    'id': layer_id,
+                    'name': layer.name(),
+                    'type': self._get_layer_type(layer),
+                    'visible': self.iface.layerTreeView().isLayerVisible(layer) if self.iface.layerTreeView() else True
+                })
+            except Exception as e:
+                self.logger.warning(f"Error getting layer info for {layer_id}: {str(e)}")
         
         # Get current canvas extent
-        canvas = self.iface.mapCanvas()
-        extent = canvas.extent()
+        try:
+            canvas = self.iface.mapCanvas()
+            extent = canvas.extent()
+            
+            extent_dict = {
+                'xmin': extent.xMinimum(),
+                'ymin': extent.yMinimum(),
+                'xmax': extent.xMaximum(),
+                'ymax': extent.yMaximum()
+            }
+            scale = canvas.scale()
+        except Exception as e:
+            self.logger.warning(f"Error getting canvas info: {str(e)}")
+            extent_dict = {'xmin': 0, 'ymin': 0, 'xmax': 1, 'ymax': 1}
+            scale = 1
         
         # Gather context information
         context = {
             'active_layers': layers,
             'selected_layer': self.iface.activeLayer().name() if self.iface.activeLayer() else None,
-            'crs': project.crs().authid(),
-            'extent': {
-                'xmin': extent.xMinimum(),
-                'ymin': extent.yMinimum(),
-                'xmax': extent.xMaximum(),
-                'ymax': extent.yMaximum()
-            },
-            'scale': canvas.scale()
+            'crs': project.crs().authid() if project.crs().isValid() else 'EPSG:4326',
+            'extent': extent_dict,
+            'scale': scale
         }
         
         return context
@@ -190,19 +231,23 @@ class GISEventDispatcher(QObject):
         Returns:
             Layer type as string
         """
-        if layer.type() == QgsMapLayer.VectorLayer:
-            geom_type = layer.geometryType()
-            if geom_type == QgsWkbTypes.PointGeometry:
-                return "point"
-            elif geom_type == QgsWkbTypes.LineGeometry:
-                return "line"
-            elif geom_type == QgsWkbTypes.PolygonGeometry:
-                return "polygon"
+        try:
+            if layer.type() == QgsMapLayer.VectorLayer:
+                geom_type = layer.geometryType()
+                if geom_type == QgsWkbTypes.PointGeometry:
+                    return "point"
+                elif geom_type == QgsWkbTypes.LineGeometry:
+                    return "line"
+                elif geom_type == QgsWkbTypes.PolygonGeometry:
+                    return "polygon"
+                else:
+                    return "vector"
+            elif layer.type() == QgsMapLayer.RasterLayer:
+                return "raster"
             else:
-                return "vector"
-        elif layer.type() == QgsMapLayer.RasterLayer:
-            return "raster"
-        else:
+                return "unknown"
+        except Exception as e:
+            self.logger.warning(f"Error determining layer type: {str(e)}")
             return "unknown"
             
     def execute_gis_operation(self, operation: str, **params) -> Tuple[bool, str, Any]:
@@ -216,9 +261,9 @@ class GISEventDispatcher(QObject):
         Returns:
             Tuple of (success, message, result)
         """
-        # This method would translate operations to actual QGIS processing calls
-        # For now, this is a skeleton that would be expanded with actual implementations
-        
+        if not PROCESSING_AVAILABLE:
+            return False, "QGIS processing framework not available", None
+            
         try:
             if operation == 'buffer':
                 return self._execute_buffer_operation(**params)
@@ -231,45 +276,169 @@ class GISEventDispatcher(QObject):
             else:
                 return False, f"Operation {operation} not implemented", None
         except Exception as e:
+            self.logger.error(f"Error in {operation}: {str(e)}")
+            self.logger.error(traceback.format_exc())
             return False, f"Error in {operation}: {str(e)}", None
             
     def _execute_buffer_operation(self, input_layer, distance, **kwargs):
         """Execute buffer operation using QGIS processing."""
-        # This would be implemented with actual QGIS processing calls
-        # For example:
-        # from qgis.core import processing
-        # result = processing.run("native:buffer", {
-        #     'INPUT': input_layer,
-        #     'DISTANCE': distance,
-        #     'SEGMENTS': kwargs.get('segments', 5),
-        #     'END_CAP_STYLE': kwargs.get('end_cap_style', 0),
-        #     'JOIN_STYLE': kwargs.get('join_style', 0),
-        #     'MITER_LIMIT': kwargs.get('miter_limit', 2),
-        #     'DISSOLVE': kwargs.get('dissolve', False),
-        #     'OUTPUT': 'memory:'
-        # })
-        # return True, "Buffer created successfully", result['OUTPUT']
-        
-        # For now, return a placeholder
-        return True, "Buffer operation simulated", "buffer_result"
+        try:
+            # Get the actual layer object
+            layer = self._get_layer_by_name(input_layer)
+            if not layer:
+                return False, f"Layer '{input_layer}' not found", None
+                
+            # Prepare parameters
+            params = {
+                'INPUT': layer,
+                'DISTANCE': distance,
+                'SEGMENTS': kwargs.get('segments', 5),
+                'END_CAP_STYLE': kwargs.get('end_cap_style', 0),
+                'JOIN_STYLE': kwargs.get('join_style', 0),
+                'MITER_LIMIT': kwargs.get('miter_limit', 2),
+                'DISSOLVE': kwargs.get('dissolve', False),
+                'OUTPUT': 'TEMPORARY_OUTPUT'
+            }
+            
+            # Execute the processing algorithm
+            result = processing.run("native:buffer", params)
+            
+            # Add result layer to map
+            if 'OUTPUT' in result:
+                output_layer = result['OUTPUT']
+                output_layer.setName(f"{input_layer}_buffer_{distance}m")
+                QgsProject.instance().addMapLayer(output_layer)
+                
+                return True, f"Buffer created successfully for {input_layer}", output_layer
+            else:
+                return False, "Buffer operation failed - no output generated", None
+                
+        except QgsProcessingException as e:
+            return False, f"Processing error: {str(e)}", None
+        except Exception as e:
+            return False, f"Unexpected error in buffer operation: {str(e)}", None
         
     def _execute_clip_operation(self, input_layer, overlay_layer, **kwargs):
         """Execute clip operation using QGIS processing."""
-        # This would be implemented with actual QGIS processing calls
-        # For now, return a placeholder
-        return True, "Clip operation simulated", "clip_result"
+        try:
+            # Get the actual layer objects
+            input_lyr = self._get_layer_by_name(input_layer)
+            overlay_lyr = self._get_layer_by_name(overlay_layer)
+            
+            if not input_lyr:
+                return False, f"Input layer '{input_layer}' not found", None
+            if not overlay_lyr:
+                return False, f"Overlay layer '{overlay_layer}' not found", None
+                
+            # Prepare parameters
+            params = {
+                'INPUT': input_lyr,
+                'OVERLAY': overlay_lyr,
+                'OUTPUT': 'TEMPORARY_OUTPUT'
+            }
+            
+            # Execute the processing algorithm
+            result = processing.run("native:clip", params)
+            
+            # Add result layer to map
+            if 'OUTPUT' in result:
+                output_layer = result['OUTPUT']
+                output_layer.setName(f"{input_layer}_clipped_by_{overlay_layer}")
+                QgsProject.instance().addMapLayer(output_layer)
+                
+                return True, f"Clip operation completed successfully", output_layer
+            else:
+                return False, "Clip operation failed - no output generated", None
+                
+        except QgsProcessingException as e:
+            return False, f"Processing error: {str(e)}", None
+        except Exception as e:
+            return False, f"Unexpected error in clip operation: {str(e)}", None
         
     def _execute_select_operation(self, input_layer, expression, **kwargs):
-        """Execute selection operation using QGIS processing."""
-        # This would be implemented with actual QGIS processing calls
-        # For now, return a placeholder
-        return True, "Select operation simulated", "select_result"
+        """Execute selection operation."""
+        try:
+            # Get the actual layer object
+            layer = self._get_layer_by_name(input_layer)
+            if not layer:
+                return False, f"Layer '{input_layer}' not found", None
+                
+            # Perform selection
+            layer.selectByExpression(expression)
+            selected_count = layer.selectedFeatureCount()
+            
+            return True, f"Selected {selected_count} features from {input_layer}", selected_count
+            
+        except Exception as e:
+            return False, f"Selection error: {str(e)}", None
         
     def _execute_intersection_operation(self, input_layer, overlay_layer, **kwargs):
         """Execute intersection operation using QGIS processing."""
-        # This would be implemented with actual QGIS processing calls
-        # For now, return a placeholder
-        return True, "Intersection operation simulated", "intersection_result"
+        try:
+            # Get the actual layer objects
+            input_lyr = self._get_layer_by_name(input_layer)
+            overlay_lyr = self._get_layer_by_name(overlay_layer)
+            
+            if not input_lyr:
+                return False, f"Input layer '{input_layer}' not found", None
+            if not overlay_lyr:
+                return False, f"Overlay layer '{overlay_layer}' not found", None
+                
+            # Prepare parameters
+            params = {
+                'INPUT': input_lyr,
+                'OVERLAY': overlay_lyr,
+                'INPUT_FIELDS': kwargs.get('input_fields', []),
+                'OVERLAY_FIELDS': kwargs.get('overlay_fields', []),
+                'OUTPUT': 'TEMPORARY_OUTPUT'
+            }
+            
+            # Execute the processing algorithm
+            result = processing.run("native:intersection", params)
+            
+            # Add result layer to map
+            if 'OUTPUT' in result:
+                output_layer = result['OUTPUT']
+                output_layer.setName(f"{input_layer}_intersect_{overlay_layer}")
+                QgsProject.instance().addMapLayer(output_layer)
+                
+                return True, f"Intersection operation completed successfully", output_layer
+            else:
+                return False, "Intersection operation failed - no output generated", None
+                
+        except QgsProcessingException as e:
+            return False, f"Processing error: {str(e)}", None
+        except Exception as e:
+            return False, f"Unexpected error in intersection operation: {str(e)}", None
+    
+    def _get_layer_by_name(self, layer_name: str):
+        """
+        Get a layer by name from the current project.
+        
+        Args:
+            layer_name: Name of the layer to find
+            
+        Returns:
+            QgsMapLayer or None if not found
+        """
+        project = QgsProject.instance()
+        
+        # Try exact match first
+        for layer in project.mapLayers().values():
+            if layer.name() == layer_name:
+                return layer
+                
+        # Try case-insensitive match
+        for layer in project.mapLayers().values():
+            if layer.name().lower() == layer_name.lower():
+                return layer
+                
+        # Try partial match
+        for layer in project.mapLayers().values():
+            if layer_name.lower() in layer.name().lower():
+                return layer
+                
+        return None
         
     def cleanup(self):
         """Clean up resources when the plugin is unloaded."""
@@ -282,9 +451,10 @@ class GISEventDispatcher(QObject):
             project.layersWillBeRemoved.disconnect(self._on_layers_will_be_removed)
             project.readProject.disconnect(self._on_project_read)
             project.writeProject.disconnect(self._on_project_write)
-        except:
+        except Exception as e:
             # Connections might already be removed
-            pass
+            self.logger.warning(f"Error disconnecting signals: {str(e)}")
         
         # Clear handler registrations
         self.command_handlers.clear()
+        self.operation_history.clear()
