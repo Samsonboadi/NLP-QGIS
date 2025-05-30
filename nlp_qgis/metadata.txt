@@ -1,0 +1,19 @@
+# metadata.txt
+"""
+[general]
+name=NLP GIS Assistant
+qgisMinimumVersion=3.0
+description=Use natural language to control QGIS
+version=0.1
+author=Your Name
+email=your.email@example.com
+
+about=This plugin allows users to control QGIS using natural language commands, integrating NLP with GIS functionality.
+
+tracker=https://github.com/yourusername/nlp-gis/issues
+repository=https://github.com/yourusername/nlp-gis
+
+hasProcessingProvider=no
+experimental=True
+deprecated=False
+"""
